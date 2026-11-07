@@ -1,0 +1,21 @@
+# Elgato's installer, driver, firmware and anything decompiled from them:
+# never commit these (see CONTRIBUTING.md).
+re/
+*.msi
+*.sys
+*.SYS
+*.pdb
+*.PDB
+*.HEX
+
+# Build output
+*.o
+userspace/hd60pro
+build/
+
+# Local scratch
+.superpowers/
+*.wav
+*.yuv
+*.pcm
+*.h264

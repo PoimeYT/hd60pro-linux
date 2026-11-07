@@ -1,0 +1,9 @@
+name: build
+on: [push, pull_request]
+jobs:
+  driver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build userspace driver (warnings are errors)
+        run: make -C userspace CFLAGS="-O2 -g -Wall -Wextra -Wno-unused-parameter -Werror"

@@ -1,0 +1,33 @@
+name: Bug report
+description: Something that used to work, or should work, is broken.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Output with -v
+      description: Run the failing command with `-v` (or `-vv` to log every mailbox command) and paste the output.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Card IDs
+      description: Output of `lspci -nn -d 12ab: -vv | grep -E "12ab|Subsystem"`
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Distribution, kernel version, commit or version of hd60pro-linux
+    validations:
+      required: true
