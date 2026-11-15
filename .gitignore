@@ -19,3 +19,12 @@ build/
 *.yuv
 *.pcm
 *.h264
+
+# App build output (qmake)
+app/Makefile
+app/.qmake.stash
+app/hd60pro-app
+app/tests/Makefile
+app/tests/.qmake.stash
+app/tests/tst_logic
+app/tests/target_wrapper.sh
