@@ -13,10 +13,27 @@
 int v4l2out_open(struct v4l2out *o, const char *dev, unsigned width, unsigned height, unsigned fps)
 {
 	memset(o, 0, sizeof(*o));
-	o->fd = open(dev, O_RDWR);
+	o->fd = open(dev, O_RDWR | O_CLOEXEC);
 	if (o->fd < 0) {
-		fprintf(stderr, "v4l2out: open %s: %s\n", dev, strerror(errno));
-		return -errno;
+		int e = errno;
+		fprintf(stderr, "v4l2out: open %s: %s\n", dev, strerror(e));
+		return -e;
+	}
+	int e;
+	/* Only ever write to an output (loopback) device, never a real camera. */
+	struct v4l2_capability cap = { 0 };
+	if (ioctl(o->fd, VIDIOC_QUERYCAP, &cap)) {
+		e = errno;
+		fprintf(stderr, "v4l2out: %s is not a V4L2 device: %s\n", dev, strerror(e));
+		goto fail;
+	}
+	uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+	/* v4l2loopback hides its output side while a producer is attached, so go by the driver name too. */
+	if (!(caps & V4L2_CAP_VIDEO_OUTPUT) && strcmp((const char *)cap.driver, "v4l2 loopback")) {
+		e = EINVAL;
+		fprintf(stderr, "v4l2out: %s (%s) is a camera, not a v4l2loopback device: not writing to it\n", dev,
+			(const char *)cap.card);
+		goto fail;
 	}
 	struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
 	f.fmt.pix.width = width;
@@ -27,9 +44,15 @@ int v4l2out_open(struct v4l2out *o, const char *dev, unsigned width, unsigned he
 	f.fmt.pix.sizeimage = width * height * 3 / 2;
 	f.fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
 	if (ioctl(o->fd, VIDIOC_S_FMT, &f)) {
-		fprintf(stderr, "v4l2out: S_FMT %ux%u: %s\n", width, height, strerror(errno));
-		close(o->fd);
-		return -errno;
+		e = errno;
+		fprintf(stderr, "v4l2out: S_FMT %ux%u: %s\n", width, height, strerror(e));
+		goto fail;
+	}
+	if (f.fmt.pix.width != width || f.fmt.pix.height != height || f.fmt.pix.pixelformat != V4L2_PIX_FMT_YUV420) {
+		e = EBUSY;
+		fprintf(stderr, "v4l2out: %s is fixed to %ux%u, wanted %ux%u I420 (close the programs reading it)\n", dev,
+			f.fmt.pix.width, f.fmt.pix.height, width, height);
+		goto fail;
 	}
 	struct v4l2_streamparm p = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
 	p.parm.output.timeperframe.numerator = 1;
@@ -37,12 +60,22 @@ int v4l2out_open(struct v4l2out *o, const char *dev, unsigned width, unsigned he
 	ioctl(o->fd, VIDIOC_S_PARM, &p);	/* optional on v4l2loopback */
 	o->width = width;
 	o->height = height;
-	o->tmp = malloc(width * height * 3 / 2);
-	return o->tmp ? 0 : -ENOMEM;
+	o->tmp = malloc((size_t)width * height * 3 / 2);
+	if (!o->tmp) {
+		e = ENOMEM;
+		goto fail;
+	}
+	return 0;
+fail:
+	close(o->fd);
+	o->fd = -1;
+	return -e;
 }
 
 int v4l2out_write_i420(struct v4l2out *o, const uint8_t *frame, unsigned stride)
 {
+	if (o->fd < 0 || !o->tmp)
+		return -EBADF;
 	size_t size = (size_t)o->width * o->height * 3 / 2;
 	const uint8_t *src = frame;
 	if (stride != o->width) {
@@ -65,7 +98,7 @@ int v4l2out_write_i420(struct v4l2out *o, const uint8_t *frame, unsigned stride)
 
 void v4l2out_close(struct v4l2out *o)
 {
-	if (o->fd > 0)
+	if (o->fd >= 0)
 		close(o->fd);
 	free(o->tmp);
 	o->tmp = NULL;

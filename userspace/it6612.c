@@ -830,6 +830,8 @@ static void parse_cea_edid(struct it6612 *t, const uint8_t *e)
 	unsigned p = 4;
 	while (p < end && p < 128) {
 		uint8_t len = e[p] & 0x1f, tag = e[p] >> 5;
+		if (p + 1 + len > 128)
+			break;	/* data block runs past the EDID block: malformed */
 		switch (tag) {
 		case 1: {	/* audio */
 			p++;
@@ -850,6 +852,8 @@ static void parse_cea_edid(struct it6612 *t, const uint8_t *e)
 				uint8_t vic = e[p] & 0x7f;
 				for (unsigned k = 0; InputModeTable[k * 16] != 0x22; k++)
 					if (InputModeTable[k * 16 + 4] == vic) {
+						if (B(0x4b) >= 0x7f)
+							break;	/* VIC list full (0x4d..0xcc) */
 						B(0x4d + B(0x4b)) = vic;
 						if (e[p] & 0x80) {
 							B(0x4c) = B(0x4b);

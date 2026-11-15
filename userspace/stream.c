@@ -131,9 +131,21 @@ static void reduce(unsigned *a, unsigned *b)
 		}
 }
 
+/* A frame handed to the consumer is stride x height x 1.5 bytes of one DMA buffer. */
+bool stream_mode_fits(const struct video_mode *mode)
+{
+	uint64_t stride = (mode->width + 15) & ~15u;
+	uint64_t cy = (uint64_t)mode->height * (mode->interlaced ? 2 : 1);
+	return mode->width && mode->height && stride * cy * 3 / 2 <= VIDEO_BUF_SIZE;
+}
+
 int stream_start(struct mz_dev *m, struct stream *s, const struct video_mode *mode, uint8_t colorimetry)
 {
 	const struct stream_cfg *c = &s->cfg;
+	if (!stream_mode_fits(mode)) {
+		fprintf(stderr, "stream: %ux%u does not fit the card's video buffers\n", mode->width, mode->height);
+		return -EINVAL;
+	}
 	s->mode = *mode;
 	unsigned cx = mode->width, cy = mode->height, fps = mode->fps;
 	bool interlaced = mode->interlaced;
@@ -302,7 +314,7 @@ int stream_poll(struct mz_dev *m, struct stream *s, void (*cb)(const struct fram
 		for (unsigned k = count; k > 0; k--) {
 			unsigned slot = (vidx - (k - 1)) & 3;
 			uint8_t *vb = s->video[slot % s->nvideo].virt;
-			if (!(vb[4] & 1))
+			if (!vb || !(vb[4] & 1))
 				continue;
 			struct frame f = { FRAME_VIDEO, vb, ((cx + 15) & ~15u) * cy * 3 / 2, slot, false };
 			cb(&f, arg);

@@ -51,6 +51,8 @@ void stream_default_cfg(struct stream_cfg *c);
 int stream_alloc(struct mz_dev *m, struct stream *s, bool force_shared);
 void stream_free(struct mz_dev *m, struct stream *s);
 int stream_register_buffers(struct mz_dev *m, struct stream *s);
+/* False for modes whose frames would not fit a video buffer (capture is refused). */
+bool stream_mode_fits(const struct video_mode *mode);
 int stream_start(struct mz_dev *m, struct stream *s, const struct video_mode *mode, uint8_t colorimetry);
 int stream_stop(struct mz_dev *m);
 /* Polls the card; calls cb for each completed frame. Returns frames seen. */
