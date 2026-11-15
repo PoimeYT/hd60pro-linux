@@ -1,102 +1,226 @@
 # hd60pro-linux
 
-A Linux driver for the **Elgato Game Capture HD60 Pro** (PCIe), reverse
-engineered from Elgato's Windows driver. Elgato never shipped Linux support
-for this card; this project makes it a normal Linux capture device:
+Use the **Elgato Game Capture HD60 Pro** (the internal PCIe card) on Linux.
+Elgato never released Linux support for it; this project is a driver and a
+small app, reverse engineered from Elgato's Windows driver.
 
-- **Video**: uncompressed 1080p60 into a v4l2loopback camera, usable by OBS,
-  ffmpeg, browsers and anything else that reads a webcam.
-- **Audio**: HDMI audio as a PipeWire/PulseAudio input called
-  "HD60 Pro Audio".
-- **HDMI OUT passthrough**: the card's HDMI output works, with picture and
-  sound, at the input's resolution (up to 1080p60).
+What you get:
 
-It runs entirely in userspace through [VFIO](https://docs.kernel.org/driver-api/vfio.html),
-so a bug cannot crash your kernel, and the IOMMU confines the card's DMA to
-the buffers the driver gives it.
+- **An app** with a live preview, a Record button and a Listen button that
+  plays the game sound in your headphones.
+- **A camera** called "HD60 Pro" (1080p60, uncompressed) that OBS, ffmpeg,
+  browsers and video-call apps can use.
+- **An audio input** called "HD60 Pro Audio".
+- **HDMI OUT passthrough** to your TV or monitor, with picture and sound.
+
+After installing, the card is set up at every boot and the driver starts when
+you log in. There is nothing to run by hand.
 
 > Not affiliated with, endorsed by, or supported by Elgato or Corsair.
 > "Elgato" and "Game Capture HD60 Pro" are trademarks of their owners and are
 > used here only to say which hardware this works with.
 
-## Status
+## Will it work for me?
+
+You need:
+
+- **The card**: an HD60 Pro, the internal PCIe one. Check with:
+
+  ```bash
+  lspci -nn -d 12ab:
+  ```
+
+  It should print one line ending in `[12ab:0380]`. Nothing printed means the
+  card is not detected. The USB capture devices (HD60 S, HD60 X, Cam Link) and
+  the 4K60 Pro are different hardware and are not supported.
+  [Which revision do I have?](COMPATIBILITY.md#identify-your-card)
+- **A 64-bit Intel or AMD PC** with virtualisation for devices (Intel VT-d or
+  AMD-Vi, together called the IOMMU). Almost every PC from the last ten years
+  has it; step 2 below switches it on.
+- **A distribution with systemd and PipeWire**. That is the default on current
+  Fedora, Ubuntu, Debian, Arch and their derivatives.
+
+Tested on Fedora 44 and CachyOS (Arch-based) with a Nintendo Switch 2 at
+1080p60. The Debian/Ubuntu instructions below follow the same steps but have
+not been run by us; please [report](CONTRIBUTING.md#reporting-hardware-results)
+how it goes. The card cannot capture or pass through 1440p, 4K or 120 Hz.
+Details are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 | Feature | State |
 | --- | --- |
-| Card bring-up, firmware handshake | Working |
-| HDMI input detection (resolution, frame rate, audio rate, colour space) | Working |
-| Raw video capture, 1080p60 | Working, 60.00 fps measured |
+| Video capture, 1080p60 | Working |
 | Audio capture (48 kHz stereo) | Working |
 | HDMI OUT passthrough (picture + sound) | Working |
-| HDCP on HDMI OUT for encrypted sources | Ported, untested |
-| Card's built-in H.264 encoder | Not working yet (raw capture is used instead) |
-| Companion app (preview, record, headphone listening) | New, see [The app](#the-app) |
-| Setup at boot, driver at login (`system/install.sh`) | New, see [Install](#install-set-up-at-boot-driver-starts-at-login) |
-| Packages | Planned |
+| App: preview, record, listen | Working, new |
+| Copy-protected (HDCP) sources | Not expected to capture; passthrough untested |
+| The card's built-in H.264 encoder | Not working (not needed: the PC encodes) |
+| Distribution packages (AUR, RPM, deb) | Not yet: install from source as below |
 
-Tested with a Nintendo Switch 2 at 1080p60 and a Samsung monitor on HDMI OUT.
-See [COMPATIBILITY.md](COMPATIBILITY.md) for cards, modes and systems.
+## Install
 
-## Requirements
+### 1. Install what it needs
 
-- An HD60 Pro (PCI ID `12ab:0380`, subsystem vendor `1cfa`).
-  [Which revision do I have?](COMPATIBILITY.md#identify-your-card)
-- x86-64 Linux with the IOMMU enabled (`/sys/kernel/iommu_groups/` is not
-  empty). Intel systems often need `intel_iommu=on` on the kernel command line.
-- The `vfio-pci` kernel module.
-- [v4l2loopback](https://github.com/umlaeute/v4l2loopback) 0.12 or newer.
-- PipeWire with PulseAudio compatibility (`pactl`), for the audio input.
-- A C compiler and `make`.
-
-## Install (set up at boot, driver starts at login)
+**Arch, CachyOS, EndeavourOS, Manjaro**
 
 ```bash
+sudo pacman -S --needed base-devel git pciutils qt6-base qt6-multimedia qt6-multimedia-ffmpeg ffmpeg pipewire pipewire-pulse libpulse
+```
+
+You also need the `v4l2loopback` kernel module. CachyOS kernels include it.
+On the others install it with:
+
+```bash
+sudo pacman -S --needed v4l2loopback-dkms linux-headers
+```
+
+(use the headers package that matches your kernel, for example
+`linux-lts-headers` or `linux-zen-headers`).
+
+**Fedora**
+
+```bash
+sudo dnf install gcc gcc-c++ make git pciutils qt6-qtbase-devel qt6-qtmultimedia-devel pipewire-utils pulseaudio-utils ffmpeg-free
+```
+
+`v4l2loopback` is not in Fedora itself. Enable
+[RPM Fusion](https://rpmfusion.org/Configuration) and install it from there:
+
+```bash
+sudo dnf install v4l2loopback
+```
+
+RPM Fusion's full `ffmpeg` (in place of `ffmpeg-free`) is needed for
+recording with an NVIDIA card's encoder.
+
+**Debian, Ubuntu, Linux Mint, Pop!_OS** (not yet tested by us)
+
+```bash
+sudo apt install build-essential git pciutils qmake6 qt6-base-dev qt6-multimedia-dev ffmpeg pipewire-pulse pipewire-bin pulseaudio-utils v4l2loopback-dkms
+```
+
+**Other distributions** need the same things under their own names: a C and
+C++ compiler with `make`, Qt 6 base and multimedia (with `qmake6`), `ffmpeg`,
+PipeWire with its PulseAudio replacement, `pactl`, `pw-loopback`, and the
+`v4l2loopback` kernel module. Without Qt the driver is still installed and
+only the app is skipped.
+
+### 2. Switch the IOMMU on
+
+Check whether it already is:
+
+```bash
+ls /sys/kernel/iommu_groups | wc -l
+```
+
+A number above 0 means it is on: go to step 3. If it prints 0:
+
+1. In your PC's firmware (BIOS/UEFI) setup, enable **VT-d** (Intel) or
+   **AMD-Vi / IOMMU / SVM** (AMD).
+2. **AMD**: that is normally all. **Intel**: also add `intel_iommu=on` to the
+   kernel command line. How depends on your bootloader:
+
+   - **GRUB** (Ubuntu, Debian, Mint, most Arch installs): edit
+     `/etc/default/grub`, add `intel_iommu=on` inside the quotes of
+     `GRUB_CMDLINE_LINUX_DEFAULT`, then run `sudo update-grub`
+     (Debian/Ubuntu) or `sudo grub-mkconfig -o /boot/grub/grub.cfg` (Arch).
+   - **Fedora**: `sudo grubby --update-kernel=ALL --args="intel_iommu=on"`
+   - **systemd-boot**: add it to `/etc/kernel/cmdline` and regenerate the
+     entries with your distribution's tool, or append it to the `options`
+     line of the entry in `/boot/loader/entries/`.
+   - **Limine** (CachyOS): add it inside the quotes of `KERNEL_CMDLINE` in
+     `/etc/default/limine`, then run `sudo limine-update`.
+
+3. Reboot and run the check again.
+
+Make a copy of the file before you edit it. This is the only step that
+touches your boot configuration; the installer never does.
+
+### 3. Get the code and install
+
+```bash
+git clone https://github.com/PoimeYT/hd60pro-linux.git
+cd hd60pro-linux
 ./system/install.sh
 ```
 
-Run it as your normal user; it asks for `sudo` for the system parts. After
-that, every boot binds the card to `vfio-pci` for your user and creates the
-"HD60 Pro" camera at `/dev/video60`, and every login starts the driver
-(`hd60pro.service`, a systemd user service). The IOMMU still has to be on
-(`intel_iommu=on` on Intel); the installer does not touch the bootloader.
+Run the installer as your normal user, not with `sudo`. It asks for your
+password for the system parts, builds the driver and the app, and tells you
+at the end whether anything is still missing.
 
-The boot step only ever acts on the HD60 Pro: it finds it by PCI ID, leaves it
-alone if it shares an IOMMU group with a device in use, and never unbinds or
-rebinds anything else. If the system is not ready, the service is skipped
-instead of restarting in a loop; `hd60pro check` says why.
+Then **log out and back in** once (or reboot), so that the memory limit the
+driver needs applies.
+
+### 4. Use it
+
+Connect your console to the card's **HDMI IN** and, if you want passthrough,
+your TV or monitor to **HDMI OUT**.
+
+- Open **HD60 Pro** from your application menu for the preview, recording and
+  listening. Recordings go to `~/Videos/HD60 Pro/`.
+- In **OBS**, add *Video Capture Device (V4L2)* → *HD60 Pro* and
+  *Audio Input Capture* → *HD60 Pro Audio*. Streaming is OBS's job; the app
+  does not stream.
+- Passthrough, the camera and the audio input work whether or not the app is
+  open.
+
+## If something does not work
+
+Start with the driver's own check. It only reads system information and never
+touches the card:
 
 ```bash
-systemctl --user status hd60pro.service   # state
-journalctl --user -u hd60pro -b           # driver output
-./system/uninstall.sh                     # remove everything again
+hd60pro check
 ```
 
-## The app
+It names the first thing that is wrong and what to do about it.
 
-`system/install.sh` also builds and installs the app when Qt 6 is present
-(`qt6-base` and `qt6-multimedia` on Arch; the `-devel`/`-dev` packages on
-Fedora and Debian/Ubuntu). It appears in the application menu as **HD60 Pro**.
+| What you see | What it means |
+| --- | --- |
+| "The IOMMU is off" | Step 2 is not done, or you have not rebooted since. |
+| "shares IOMMU group … with devices the system is using" | The slot the card is in is not isolated. Move the card to another PCIe slot (one wired directly to the CPU usually works). Do **not** follow VFIO guides that tell you to bind the other devices or to patch the kernel (ACS override). |
+| "not bound to vfio-pci" | The boot step did not run: `systemctl status hd60pro-bind.service` |
+| The app says "The driver is not running" | Press *Start the driver* in the app; it shows the reason if it cannot. |
+| The app says "No signal" | The source is off, asleep, or plugged into HDMI OUT instead of HDMI IN. |
+| No "HD60 Pro" camera in OBS | `v4l2loopback` is missing or was already loaded with other settings: `ls /dev/video60`, then reboot. |
+| Picture but a slow consumer sees torn frames | The memory limit has not applied yet: log out and back in. |
+| The card is passed through to a virtual machine | Only one of them can use it. Shut the VM down first. |
 
-- **Preview** of the game fills the window.
-- **Record** saves to `~/Videos/HD60 Pro/` with one click. Quality presets
-  and a custom mode (H.264/HEVC, bitrate, resolution, MP4/MKV) are in
-  Settings. The GPU encoder is used when it works (NVENC, then VAAPI), else
-  software. MP4 files are written so that a crash still leaves a playable file,
-  and a recording stops cleanly if the signal is lost or the mode changes.
-- **Listen** plays the game sound on your headphones or speakers, with its
-  own volume. With Listen on, closing the window keeps the app in the system
-  tray; "Open in the tray when I log in" in Settings makes that permanent.
+Driver messages: `journalctl --user -u hd60pro -b`. For bug reports see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-The app needs `ffmpeg`, `pw-loopback` and `pactl`. It only talks to the
-driver service; HDMI passthrough, the camera and the audio input work without
-it. Streaming is OBS's job: use the "HD60 Pro" camera and "HD60 Pro Audio".
+## Uninstall
 
-Tests: `cd app/tests && qmake6 && make && ./tst_logic`.
+```bash
+./system/uninstall.sh
+```
 
-## Quick start (manual setup)
+This removes everything the installer added. If you added `intel_iommu=on`
+yourself in step 2 you can leave it; it does no harm.
 
-These steps are what `system/install.sh` automates; use them to try the
-driver without installing anything.
+## Is this safe for my system?
+
+The driver is an ordinary program, not a kernel module, so a bug in it cannot
+crash the kernel. It is given the card through the kernel's VFIO interface,
+and the IOMMU limits the card to the memory the driver hands it.
+
+- It only ever touches the HD60 Pro. The card is found by its hardware ID,
+  and both the boot step and the driver refuse any other device.
+- It refuses to run when the IOMMU is off, and when the card shares an IOMMU
+  group with a device your system is using. It never unbinds or rebinds
+  another device.
+- The installer adds a handful of small files under `/usr/local` and `/etc`
+  (listed at the top of [system/install.sh](system/install.sh)). It does not
+  touch the bootloader, the initramfs or udev rules.
+- It never sends the commands that rewrite the card's firmware, so it cannot
+  brick the card.
+
+More detail is in [SECURITY.md](SECURITY.md).
+
+## Trying it without installing
+
+The driver can be built and run by hand. Nothing here is permanent; a reboot
+undoes all of it. Install the dependencies and switch the IOMMU on first
+(steps 1 and 2 above).
 
 > **Read this first.** Only ever bind the HD60 Pro itself to `vfio-pci`. If the
 > card shares its IOMMU group with other devices (step 1 shows them), do
@@ -171,7 +295,7 @@ driver without installing anything.
    sudo v4l2loopback-ctl add -n "HD60 Pro" -x 1 /dev/video60
    ```
 
-6. **Build and run**:
+6. **Build and run** (as your normal user):
 
    ```bash
    make -C userspace
@@ -242,6 +366,10 @@ docs/          protocol notes and design documents
 ```
 
 ## Safety
+
+What the driver does to protect the rest of the system is described under
+[Is this safe for my system?](#is-this-safe-for-my-system) and in
+[SECURITY.md](SECURITY.md).
 
 The card keeps its software in on-board flash. Elgato's driver can rewrite
 that flash; **this driver never sends the firmware or flash commands**

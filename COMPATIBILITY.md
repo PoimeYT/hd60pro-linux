@@ -72,9 +72,9 @@ turns the output on anyway, which wakes them.
 
 | Item | Tested |
 | --- | --- |
-| Distribution | Fedora 44 |
-| Kernel | 7.2.4 |
-| CPU / IOMMU | Intel, `intel_iommu=on iommu=pt` |
+| Distribution | Fedora 44; CachyOS (Arch-based) |
+| Kernel | 7.2.4; 7.3.4-cachyos |
+| CPU / IOMMU | Intel, `intel_iommu=on` (with and without `iommu=pt`) |
 | v4l2loopback | 0.15.4 |
 | PipeWire | 1.6.8 |
 | Architecture | x86-64 only |
