@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "vfio.h"
 
@@ -104,6 +105,15 @@ static inline void ep_wr(struct mz_dev *m, unsigned off, uint32_t v)
 	__sync_synchronize();
 }
 
+/* Finds HD60 Pro cards by PCI ID. Returns how many there are; bdf gets the first. */
+int mz_find_card(char *bdf, size_t len);
+/*
+ * Checks, without touching the device, that bdf is an HD60 Pro and that the
+ * system is set up so opening it is safe (IOMMU on, nothing else in its IOMMU
+ * group in use, bound to vfio-pci, group node accessible). Problems go to
+ * stderr; with report set, passed checks are printed there. 0 when all pass.
+ */
+int mz_preflight(const char *bdf, FILE *report);
 int mz_open(struct mz_dev *m, const char *bdf);
 void mz_close(struct mz_dev *m);
 void mz_ack_irq(struct mz_dev *m);

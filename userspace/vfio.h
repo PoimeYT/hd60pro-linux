@@ -3,6 +3,7 @@
 #ifndef HD60_VFIO_H
 #define HD60_VFIO_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -26,6 +27,12 @@ struct dma_buf {
 	uint64_t iova;
 	size_t size;
 };
+
+/* sysfs lookups; none of them touch the device. */
+bool pci_bdf_valid(const char *bdf);
+int pci_attr_hex(const char *bdf, const char *attr, unsigned *out);
+int pci_driver(const char *bdf, char *buf, size_t len);
+int pci_iommu_group(const char *bdf);
 
 int vfio_open(struct vfio_dev *d, const char *bdf);
 void vfio_close(struct vfio_dev *d);

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=HD60 Pro
+Comment=Preview, record and listen to the Elgato HD60 Pro
+Exec=hd60pro-app
+Icon=hd60pro
+Categories=AudioVideo;Video;Recorder;
+StartupWMClass=hd60pro-app

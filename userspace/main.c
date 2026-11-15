@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <time.h>
 
 static volatile sig_atomic_t stop_requested;
@@ -25,6 +26,23 @@ static void on_signal(int sig)
 	stop_requested = 1;
 }
 
+/*
+ * Every command that leaves the card doing something (capturing, driving
+ * HDMI OUT) must get the chance to stop it and undo what it set up, so the
+ * usual ways of ending a process only request a stop. SIGPIPE is ignored:
+ * the audio FIFO's reader (PipeWire) going away must not kill the driver.
+ */
+static void install_signals(void)
+{
+	struct sigaction sa = { .sa_handler = on_signal };
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGQUIT, &sa, NULL);
+	signal(SIGPIPE, SIG_IGN);
+}
+
 struct run_ctx {
 	struct v4l2out out;
 	unsigned stride;
@@ -32,7 +50,10 @@ struct run_ctx {
 	FILE *pcm;
 	int pipe_fd;		/* PipeWire pipe-source FIFO, -1 when unused */
 	char pipe_module[32];	/* pactl module index to unload */
+	char pipe_path[256];	/* the FIFO PipeWire reads from */
 };
+
+static void audio_pipe_close(struct run_ctx *r);
 
 static void on_run_frame(const struct frame *f, void *arg)
 {
@@ -44,8 +65,12 @@ static void on_run_frame(const struct frame *f, void *arg)
 		r->audio++;
 		if (r->pcm)
 			fwrite(f->data, 1, f->len, r->pcm);
-		if (r->pipe_fd >= 0 && write(r->pipe_fd, f->data, f->len) < 0 && errno != EAGAIN)
-			perror("audio pipe");
+		if (r->pipe_fd >= 0 && write(r->pipe_fd, f->data, f->len) < 0 && errno != EAGAIN && errno != EINTR) {
+			/* The reader is gone (PipeWire restarted): stop instead of failing 47 times a second. */
+			fprintf(stderr, "audio: pipe to PipeWire closed (%s), audio export stopped\n", strerror(errno));
+			close(r->pipe_fd);
+			r->pipe_fd = -1;
+		}
 	}
 }
 
@@ -57,7 +82,9 @@ static void on_run_frame(const struct frame *f, void *arg)
 struct monitor {
 	struct mz_dev *m;
 	struct it6612 tx;
+	bool tx_ok;		/* transmitter found; HDMI OUT is driven */
 	pthread_mutex_t lock;
+	const char *tx_name;	/* HDMI OUT state for the status file (static string) */
 	unsigned seq;		/* bumped on every detection result */
 	int got;
 	struct video_mode mode;
@@ -82,48 +109,106 @@ static void *monitor_main(void *arg)
 		} else {
 			cs = (enum colorspace)-1;
 		}
-		double t0 = mono_s();
-		int before = *(int32_t *)&mon->tx.st[4];
-		it6612_timer(&mon->tx, got == 1 ? &v : NULL, got == 1);
-		double ms = (mono_s() - t0) * 1000;
-		if (mon->m->verbose && ms > 20)
-			printf("monitor: slow HDMI-out tick %.0f ms (state %d -> %d, vic %u/%u)\n", ms, before,
-			       *(int32_t *)&mon->tx.st[4], mon->tx.st[0], mon->tx.st[0xc]);
-		if (tx_state != it6612_state_name(&mon->tx)) {
-			tx_state = it6612_state_name(&mon->tx);
-			printf("HDMI out: %s\n", tx_state);
-			fflush(stdout);
+		if (mon->tx_ok) {
+			double t0 = mono_s();
+			int before = *(int32_t *)&mon->tx.st[4];
+			it6612_timer(&mon->tx, got == 1 ? &v : NULL, got == 1);
+			double ms = (mono_s() - t0) * 1000;
+			if (mon->m->verbose && ms > 20)
+				printf("monitor: slow HDMI-out tick %.0f ms (state %d -> %d, vic %u/%u)\n", ms, before,
+				       *(int32_t *)&mon->tx.st[4], mon->tx.st[0], mon->tx.st[0xc]);
+			if (tx_state != it6612_state_name(&mon->tx)) {
+				tx_state = it6612_state_name(&mon->tx);
+				printf("HDMI out: %s\n", tx_state);
+				fflush(stdout);
+			}
 		}
+		pthread_mutex_lock(&mon->lock);
+		mon->tx_name = mon->tx_ok ? tx_state : "not available";
+		pthread_mutex_unlock(&mon->lock);
 		pthread_mutex_lock(&mon->lock);
 		mon->got = got;
 		mon->mode = v;
 		mon->seq++;
 		pthread_mutex_unlock(&mon->lock);
-		usleep(500000);
+		for (int i = 0; i < 10 && !stop_requested; i++)
+			usleep(50000);
 	}
 	return NULL;
 }
 
-#define AUDIO_FIFO "/tmp/hd60pro-audio"
+#define AUDIO_SOURCE "hd60pro"
+
+/*
+ * A run that was killed (SIGKILL, crash, power loss of the session) cannot
+ * unload its pipe-source module, and every leftover one is another dead
+ * "HD60 Pro Audio" input. Remove them before adding ours.
+ */
+static void audio_unload_stale(void)
+{
+	FILE *p = popen("pactl list short modules 2>/dev/null", "r");
+	if (!p)
+		return;
+	char line[1024];
+	while (fgets(line, sizeof(line), p)) {
+		if (!strstr(line, "module-pipe-source") || !strstr(line, "source_name=" AUDIO_SOURCE " "))
+			continue;
+		char *end;
+		unsigned long id = strtoul(line, &end, 10);
+		if (end == line)
+			continue;
+		char cmd[64];
+		snprintf(cmd, sizeof(cmd), "pactl unload-module %lu", id);
+		if (system(cmd) == 0)
+			fprintf(stderr, "audio: removed a leftover audio source from an earlier run (module %lu)\n", id);
+	}
+	pclose(p);
+}
 
 /* Expose the card's audio as a PipeWire/PulseAudio input named "HD60 Pro Audio". */
 static int audio_pipe_open(struct run_ctx *r)
 {
-	unlink(AUDIO_FIFO);
-	FILE *p = popen("pactl load-module module-pipe-source source_name=hd60pro file=" AUDIO_FIFO
-			" format=s16le rate=48000 channels=2 source_properties=device.description=HD60_Pro_Audio",
-			"r");
-	if (!p || !fgets(r->pipe_module, sizeof(r->pipe_module), p)) {
-		if (p)
-			pclose(p);
+	/* Per-user runtime directory: nobody else can pre-create or replace the FIFO there. */
+	const char *rt = getenv("XDG_RUNTIME_DIR");
+	if (!rt || rt[0] != '/' || strpbrk(rt, " \t\n'\"\\$`;&|<>()") || strlen(rt) > 200) {
+		fprintf(stderr, "audio: XDG_RUNTIME_DIR is not set (not in a user session?), audio not exported\n");
+		return -1;
+	}
+	snprintf(r->pipe_path, sizeof(r->pipe_path), "%s/hd60pro-audio", rt);
+	audio_unload_stale();
+	unlink(r->pipe_path);
+
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd),
+		 "pactl load-module module-pipe-source source_name=" AUDIO_SOURCE " file=%s"
+		 " format=s16le rate=48000 channels=2 source_properties=device.description=HD60_Pro_Audio",
+		 r->pipe_path);
+	char id[32] = "";
+	FILE *p = popen(cmd, "r");
+	bool ok = p && fgets(id, sizeof(id), p);
+	if (p && pclose(p) != 0)
+		ok = false;
+	id[strcspn(id, "\n")] = 0;
+	if (!ok || !id[0] || strspn(id, "0123456789") != strlen(id)) {
 		fprintf(stderr, "audio: pactl load-module failed, audio not exported\n");
 		return -1;
 	}
-	pclose(p);
-	r->pipe_module[strcspn(r->pipe_module, "\n")] = 0;
-	r->pipe_fd = open(AUDIO_FIFO, O_WRONLY | O_NONBLOCK);
-	if (r->pipe_fd < 0) {
-		perror("audio: open " AUDIO_FIFO);
+	snprintf(r->pipe_module, sizeof(r->pipe_module), "%s", id);
+
+	/* The module opens its end asynchronously; ENXIO means "no reader yet". */
+	for (int i = 0; i < 40 && r->pipe_fd < 0; i++) {
+		r->pipe_fd = open(r->pipe_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+		if (r->pipe_fd < 0 && errno != ENXIO && errno != ENOENT)
+			break;
+		if (r->pipe_fd < 0)
+			usleep(50000);
+	}
+	struct stat st;
+	if (r->pipe_fd < 0 || fstat(r->pipe_fd, &st) || !S_ISFIFO(st.st_mode)) {
+		/* Never stream audio into a regular file: it would grow without bound. */
+		fprintf(stderr, "audio: cannot open the FIFO %s: %s\n", r->pipe_path,
+			r->pipe_fd < 0 ? strerror(errno) : "not a FIFO");
+		audio_pipe_close(r);
 		return -1;
 	}
 	printf("audio: PipeWire source \"HD60 Pro Audio\" (module %s)\n", r->pipe_module);
@@ -142,6 +227,51 @@ static void audio_pipe_close(struct run_ctx *r)
 			fprintf(stderr, "audio: failed to unload module %s\n", r->pipe_module);
 		r->pipe_module[0] = 0;
 	}
+	if (r->pipe_path[0])
+		unlink(r->pipe_path);
+	r->pipe_path[0] = 0;
+}
+
+/*
+ * Status for the companion app: one JSON object in $XDG_RUNTIME_DIR/hd60pro.status,
+ * replaced atomically whenever something changes and removed on exit.
+ */
+static char status_path[256];
+
+static void status_write(const char *state, const struct video_mode *v, const char *hdmi_out, double fps,
+			 const char *dev)
+{
+	const char *rt = getenv("XDG_RUNTIME_DIR");
+	if (!rt || rt[0] != '/' || strlen(rt) > 200)
+		return;
+	char tmp[280];
+	snprintf(status_path, sizeof(status_path), "%s/hd60pro.status", rt);
+	snprintf(tmp, sizeof(tmp), "%s.tmp", status_path);
+	FILE *f = fopen(tmp, "w");
+	if (!f)
+		return;
+	fprintf(f, "{\"state\":\"%s\",\"pid\":%ld,\"hdmi_out\":\"%s\",\"measured_fps\":%.1f", state, (long)getpid(),
+		hdmi_out ? hdmi_out : "", fps);
+	fprintf(f, ",\"video_device\":\"");
+	for (const char *c = dev; *c; c++)	/* a path: escape the two characters JSON cares about */
+		fprintf(f, *c == '"' || *c == '\\' ? "\\%c" : "%c", *c);
+	fprintf(f, "\"");
+	if (v && v->width)
+		fprintf(f, ",\"width\":%u,\"height\":%u,\"interlaced\":%s,\"fps\":%u,\"ntsc\":%s,\"audio_rate\":%u",
+			v->width, v->interlaced ? v->height * 2 : v->height, v->interlaced ? "true" : "false", v->fps,
+			v->ntsc ? "true" : "false", v->audio_rate);
+	fprintf(f, "}\n");
+	if (fclose(f) == 0)
+		rename(tmp, status_path);
+	else
+		unlink(tmp);
+}
+
+static void status_remove(void)
+{
+	if (status_path[0])
+		unlink(status_path);
+	status_path[0] = 0;
 }
 
 static double mono_s(void)
@@ -195,6 +325,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: hd60pro [-d BDF] [-v] COMMAND\n"
+		"  check                  check that the system is set up safely (touches nothing)\n"
 		"  regs                   dump BAR0 mailbox and BAR5 registers (no commands sent)\n"
 		"  probe                  handshake with the card and print its firmware version\n"
 		"  i2c-read ADDR REG      read one byte (8-bit address, e.g. 0x9c)\n"
@@ -205,7 +336,7 @@ static void usage(void)
 		"  capture PREFIX [SECS]  stream and save PREFIX.yuv (first frames), .h264 and .pcm\n"
 		"  passthrough [SECS]     drive HDMI OUT only (no capture)\n"
 		"  tx-status [SECS]       read the display EDID and watch HDMI OUT hot-plug state\n"
-		"  run [DEV] [PCM]        stream to a v4l2loopback device (default /dev/video0)\n"
+		"  run [DEV] [PCM]        stream to a v4l2loopback device (default /dev/video60)\n"
 		"  gpio-get PIN\n");
 }
 
@@ -229,7 +360,8 @@ static void dump_regs(struct mz_dev *m)
 
 int main(int argc, char **argv)
 {
-	const char *bdf = "0000:05:00.0";
+	const char *bdf = NULL;	/* -d; otherwise the card is found by its PCI ID */
+	char found[16];
 	int verbose = 0, c;
 	while ((c = getopt(argc, argv, "d:vh")) != -1) {
 		switch (c) {
@@ -246,11 +378,44 @@ int main(int argc, char **argv)
 	char **arg = argv + optind + 1;
 	int nargs = argc - optind - 1;
 
+	static const char *const cmds[] = { "check", "regs", "probe", "i2c-read", "i2c-write", "i2c-dump", "i2c-scan",
+					    "rx-reset", "detect", "capture", "passthrough", "tx-status", "run",
+					    "gpio-get" };
+	bool known = false;
+	for (unsigned i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++)
+		known |= !strcmp(cmd, cmds[i]);
+	if (!known) {	/* before anything is opened: a typo must not touch the card */
+		usage();
+		return 2;
+	}
+
+	if (!bdf) {
+		int n = mz_find_card(found, sizeof(found));
+		if (n < 1) {
+			fprintf(stderr, "no HD60 Pro found (looked for PCI 12ab:0380/0381, subsystem vendor 1cfa)\n");
+			return 1;
+		}
+		if (n > 1)
+			fprintf(stderr, "%d HD60 Pro cards found, using %s (choose another with -d)\n", n, found);
+		bdf = found;
+	}
+	if (geteuid() == 0)
+		fprintf(stderr, "warning: running as root is not needed and the audio source will not appear in "
+				"your session; give your user access to the VFIO group node instead\n");
+
+	if (!strcmp(cmd, "check")) {
+		int r = mz_preflight(bdf, stdout);
+		if (!r)
+			printf("ok: the card can be used\n");
+		return r ? 1 : 0;
+	}
+
 	struct mz_dev m;
 	if (mz_open(&m, bdf))
 		return 1;
 	m.verbose = verbose;
 	int rc = 0;
+	install_signals();
 
 	if (!strcmp(cmd, "regs")) {
 		dump_regs(&m);
@@ -329,7 +494,7 @@ int main(int argc, char **argv)
 		mst3367_init(&m);
 		struct video_mode cur = { 0 };
 		int had = -1;
-		for (unsigned i = 0; i < secs * 2; i++) {
+		for (unsigned i = 0; i < secs * 2 && !stop_requested; i++) {
 			struct video_mode v;
 			int r = mst3367_detect(&m, &v);
 			if (r != had || (r == 1 && !mode_equal(&v, &cur))) {
@@ -350,15 +515,17 @@ int main(int argc, char **argv)
 		/* capture PREFIX [SECS]: writes PREFIX.yuv (I420), PREFIX.h264, PREFIX.pcm */
 		unsigned secs = nargs > 1 ? num(arg[1]) : 5;
 		struct stream s;
+		struct capture_out o = { .max_raw = 3 };
+		bool started = false;
 		if (stream_alloc(&m, &s, false) || stream_register_buffers(&m, &s)) {
 			fprintf(stderr, "buffer setup failed\n");
 			rc = 1;
-			goto out;
+			goto capture_done;
 		}
 		mst3367_init(&m);
 		struct video_mode v;
 		int got = 0;
-		for (int i = 0; i < 20 && got != 1; i++) {
+		for (int i = 0; i < 20 && got != 1 && !stop_requested; i++) {
 			got = mst3367_detect(&m, &v);
 			if (got != 1)
 				usleep(250000);
@@ -366,17 +533,12 @@ int main(int argc, char **argv)
 		if (got != 1) {
 			fprintf(stderr, "no input signal\n");
 			rc = 1;
-			goto out;
+			goto capture_done;
 		}
 		printf("input: ");
 		print_mode(&v);
 		mst3367_setup_csc(&m, v.cs);
-		if (stream_start(&m, &s, &v, v.colorimetry)) {
-			rc = 1;
-			goto out;
-		}
 		char path[512];
-		struct capture_out o = { .max_raw = 3 };
 		if (getenv("HD60_FRAMELOG"))
 			o.framelog = fopen(getenv("HD60_FRAMELOG"), "w");
 		if (getenv("HD60_IRQLOG"))
@@ -387,18 +549,30 @@ int main(int argc, char **argv)
 		o.h264 = fopen(path, "wb");
 		snprintf(path, sizeof(path), "%s.pcm", arg[0]);
 		o.audio = fopen(path, "wb");
-		for (unsigned t = 0; t < secs * 2000; t++) {
+		if (!o.video || !o.h264 || !o.audio) {
+			fprintf(stderr, "cannot create %s.{yuv,h264,pcm}: %s\n", arg[0], strerror(errno));
+			rc = 1;
+			goto capture_done;
+		}
+		if (stream_start(&m, &s, &v, v.colorimetry)) {
+			rc = 1;
+			goto capture_done;
+		}
+		started = true;
+		/* Size of one frame as delivered; stream_start() checked it fits the buffer. */
+		size_t frame_bytes = (size_t)((v.width + 15) & ~15u) * v.height * (v.interlaced ? 2 : 1) * 3 / 2;
+		for (unsigned t = 0; t < secs * 2000 && !stop_requested; t++) {
 			stream_poll(&m, &s, on_frame, &o);
 			usleep(500);
 			if (t % 500 == 0) {
 				const uint32_t *vb = s.video[0].virt;
 				uint32_t sum = 0;
-				for (size_t i = 0; i < 1920 * 1080 / 4; i += 97)
+				for (size_t i = 0; i < frame_bytes / 6; i += 97)
 					sum = sum * 31 + vb[i];
 				printf("    t=%.2fs video sum %08x head %08x %08x idx40 %08x\n", t / 2000.0, sum, vb[0], vb[1],
 				       mz_rd(&m, 0x40));
 				if (getenv("HD60_CLEAR"))
-					memset(s.video[0].virt, 0, 1920 * 1080 * 3 / 2);
+					memset(s.video[0].virt, 0, frame_bytes);
 			}
 			if (t % 2000 == 1999) {
 				printf("  %us: raw %u, h264 %u (%u key, %lu KiB), audio %u, idx %08x %08x %08x %08x\n",
@@ -408,6 +582,7 @@ int main(int argc, char **argv)
 			}
 		}
 		stream_stop(&m);
+		started = false;
 		printf("irq: %u interrupts, bits seen %08x\n", s.irq_count, s.irq_seen);
 		const struct dma_buf *chk[] = { &s.video[0], &s.enc[0][0], &s.audio };
 		const char *nm[] = { "video", "enc", "audio" };
@@ -423,11 +598,26 @@ int main(int argc, char **argv)
 		}
 		snprintf(path, sizeof(path), "%s.last.yuv", arg[0]);
 		FILE *lf = fopen(path, "wb");
-		fwrite(s.video[0].virt, 1, 1920 * 1080 * 3 / 2, lf);
-		fclose(lf);
-		fclose(o.video);
-		fclose(o.h264);
-		fclose(o.audio);
+		if (lf) {
+			fwrite(s.video[0].virt, 1, frame_bytes, lf);
+			fclose(lf);
+		} else {
+			perror(path);
+		}
+capture_done:
+		/* Stop the card before its buffers are unmapped, whatever went wrong. */
+		if (started)
+			stream_stop(&m);
+		if (o.video)
+			fclose(o.video);
+		if (o.h264)
+			fclose(o.h264);
+		if (o.audio)
+			fclose(o.audio);
+		if (o.framelog)
+			fclose(o.framelog);
+		if (s.irqlog)
+			fclose(s.irqlog);
 		stream_free(&m, &s);
 	} else if (!strcmp(cmd, "tx-status")) {
 		/* tx-status [SECS]: watch the IT6612 status registers and try a DDC EDID read */
@@ -445,7 +635,7 @@ int main(int argc, char **argv)
 				printf(" %02x", edid[i]);
 		printf("\n");
 		int last = -1;
-		for (unsigned i = 0; i < secs * 5; i++) {
+		for (unsigned i = 0; i < secs * 5 && !stop_requested; i++) {
 			int st = mz_i2c_read(&m, I2C_IT6612, 0x0e), i6 = mz_i2c_read(&m, I2C_IT6612, 6);
 			int v = st << 8 | i6;
 			if (v != last) {
@@ -459,7 +649,6 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "passthrough")) {
 		/* passthrough [SECS]: drive HDMI OUT only, no capture */
 		unsigned secs = nargs ? num(arg[0]) : 30;
-		signal(SIGINT, on_signal);
 		mst3367_init(&m);
 		struct it6612 tx = { .verbose = verbose };
 		if (it6612_init(&tx, &m)) {
@@ -489,28 +678,36 @@ int main(int argc, char **argv)
 		}
 	} else if (!strcmp(cmd, "run")) {
 		/* run [V4L2DEV] [PCMFILE]: stream to a v4l2loopback device until interrupted */
-		const char *dev = nargs > 0 ? arg[0] : "/dev/video0";
+		const char *dev = nargs > 0 ? arg[0] : "/dev/video60";
 		struct run_ctx r = { .out.fd = -1 };
 		r.pipe_fd = -1;
-		if (nargs > 1 && !(r.pcm = fopen(arg[1], "wb")))
-			perror(arg[1]);
-		audio_pipe_open(&r);
 		struct stream s;
+		bool streaming = false;
 		if (stream_alloc(&m, &s, false) || stream_register_buffers(&m, &s)) {
 			fprintf(stderr, "buffer setup failed\n");
 			rc = 1;
-			goto out;
+			goto run_done;
 		}
-		signal(SIGINT, on_signal);
-		signal(SIGTERM, on_signal);
+		if (nargs > 1 && !(r.pcm = fopen(arg[1], "wb")))
+			perror(arg[1]);
+		audio_pipe_open(&r);
 		mst3367_init(&m);
 		struct monitor mon = { .m = &m, .tx.verbose = verbose };
 		pthread_mutex_init(&mon.lock, NULL);
-		it6612_init(&mon.tx, &m);
+		mon.tx_ok = it6612_init(&mon.tx, &m) == 0;
+		if (!mon.tx_ok)
+			fprintf(stderr, "HDMI OUT is not available; capturing only\n");
 		pthread_t mon_thread;
-		pthread_create(&mon_thread, NULL, monitor_main, &mon);
+		if (pthread_create(&mon_thread, NULL, monitor_main, &mon)) {
+			fprintf(stderr, "cannot start the signal monitor thread\n");
+			rc = 1;
+			goto run_done;
+		}
 		struct video_mode cur = { 0 };
-		bool streaming = false;
+		bool rejected = false;	/* cur was reported as not capturable */
+		const char *shown_hdmi = NULL;
+		double shown_fps = 0;
+		bool status_dirty = true;
 		unsigned seen_seq = 0;
 		double last_report = mono_s();
 		while (!stop_requested) {
@@ -519,45 +716,83 @@ int main(int argc, char **argv)
 			unsigned seq = mon.seq;
 			int got = mon.got;
 			struct video_mode v = mon.mode;
+			const char *hdmi = mon.tx_name;
 			pthread_mutex_unlock(&mon.lock);
+			if (hdmi != shown_hdmi) {
+				shown_hdmi = hdmi;
+				status_dirty = true;
+			}
 			if (seq != seen_seq) {
 				seen_seq = seq;
-				if (got != 1 && streaming) {
+				if (got != 1 && (streaming || rejected)) {
 					printf("signal lost\n");
-					stream_stop(&m);
-					v4l2out_close(&r.out);
-					streaming = false;
-				} else if (got == 1 && (!streaming || !mode_equal(&v, &cur))) {
+					fflush(stdout);
 					if (streaming) {
 						stream_stop(&m);
 						v4l2out_close(&r.out);
 					}
+					streaming = rejected = false;
+					status_dirty = true;
+				} else if (got == 1 && ((!streaming && !rejected) || !mode_equal(&v, &cur))) {
+					if (streaming) {
+						stream_stop(&m);
+						v4l2out_close(&r.out);
+						streaming = false;
+					}
 					printf("signal: ");
 					print_mode(&v);
 					fflush(stdout);
+					cur = v;
+					status_dirty = true;
+					shown_fps = 0;
+					rejected = !stream_mode_fits(&v);
+					if (rejected) {
+						/* HDMI OUT keeps working; wait for a mode that can be captured. */
+						fprintf(stderr, "this mode is too large to capture; waiting for another\n");
+						continue;
+					}
 					unsigned h = v.interlaced ? v.height * 2 : v.height;
 					r.stride = (v.width + 15) & ~15u;
-					if (v4l2out_open(&r.out, dev, v.width, h, v.fps) ||
-					    stream_start(&m, &s, &v, v.colorimetry)) {
+					if (v4l2out_open(&r.out, dev, v.width, h, v.fps)) {
 						rc = 1;
 						break;
 					}
-					cur = v;
+					if (stream_start(&m, &s, &v, v.colorimetry)) {
+						stream_stop(&m);	/* a half-configured card must not be left running */
+						rc = 1;
+						break;
+					}
 					streaming = true;
 				}
 			}
-			if (streaming)
-				stream_poll(&m, &s, on_run_frame, &r);
+			if (streaming && stream_poll(&m, &s, on_run_frame, &r) == -ENODEV) {
+				fprintf(stderr, "the card stopped answering (removed, or reset by something else)\n");
+				streaming = false;	/* nothing left to send STOP to */
+				rc = 1;
+				break;
+			}
+			if (status_dirty) {
+				status_dirty = false;
+				bool has_mode = streaming || rejected;
+				status_write(streaming ? "streaming" : rejected ? "unsupported" : "no_signal",
+					     has_mode ? &cur : NULL, shown_hdmi, streaming ? shown_fps : 0, dev);
+			}
 			usleep(streaming ? 500 : 50000);
 			if (now - last_report >= 5) {
 				printf("  %.1f fps video, %.1f audio periods/s\n", r.frames / (now - last_report),
 				       r.audio / (now - last_report));
 				fflush(stdout);
+				shown_fps = r.frames / (now - last_report);
+				status_dirty = true;
 				r.frames = r.audio = 0;
 				last_report = now;
 			}
 		}
+		status_remove();
+		/* The monitor only exits on a stop request; without this an error exit would hang in join. */
+		stop_requested = 1;
 		pthread_join(mon_thread, NULL);
+run_done:
 		if (streaming)
 			stream_stop(&m);
 		v4l2out_close(&r.out);
@@ -566,7 +801,13 @@ int main(int argc, char **argv)
 		audio_pipe_close(&r);
 		stream_free(&m, &s);
 	} else if (!strcmp(cmd, "gpio-get") && nargs == 1) {
-		printf("%d\n", mz_gpio_get(&m, num(arg[0])));
+		int v = mz_gpio_get(&m, num(arg[0]));
+		if (v < 0) {
+			fprintf(stderr, "gpio-get failed (pins are 0..31)\n");
+			rc = 1;
+		} else {
+			printf("%d\n", v);
+		}
 	} else {
 		usage();
 		rc = 2;
