@@ -1,0 +1,120 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# hd60pro-bind USER
+#
+# Run as root at boot (hd60pro-bind.service). Hands every HD60 Pro to vfio-pci
+# and lets USER open it. It only ever acts on the HD60 Pro itself:
+#   - cards are matched by PCI ID, never by address;
+#   - a card that shares its IOMMU group with a device the system is using is
+#     left alone (nothing else is ever unbound or rebound);
+#   - a card another driver already holds is left alone.
+# Nothing here is persistent; a reboot without this script undoes it.
+#
+# HD60_SYSFS / HD60_DEV / HD60_DRYRUN exist for testing against a fake tree.
+set -u
+
+SYS=${HD60_SYSFS:-/sys}
+DEV=${HD60_DEV:-/dev}
+DRY=${HD60_DRYRUN:-}
+
+user=${1:-}
+if [ -z "$user" ] || ! id "$user" >/dev/null 2>&1; then
+	echo "usage: hd60pro-bind USER (an existing user)" >&2
+	exit 2
+fi
+
+run() {
+	if [ -n "$DRY" ]; then echo "RUN: $*"; else "$@"; fi
+}
+
+write() {	# write VALUE FILE
+	if [ -n "$DRY" ]; then echo "RUN: echo $1 > $2"; else echo "$1" > "$2"; fi
+}
+
+driver_of() {
+	if [ -e "$1/driver" ]; then basename "$(readlink "$1/driver")"; fi
+}
+
+found=0
+rc=0
+for dev in "$SYS"/bus/pci/devices/*; do
+	[ "$(cat "$dev/vendor" 2>/dev/null)" = 0x12ab ] || continue
+	case "$(cat "$dev/device" 2>/dev/null)" in 0x0380 | 0x0381) ;; *) continue ;; esac
+	[ "$(cat "$dev/subsystem_vendor" 2>/dev/null)" = 0x1cfa ] || continue
+	found=1
+	bdf=${dev##*/}
+
+	if [ ! -e "$dev/iommu_group" ]; then
+		echo "$bdf: the IOMMU is off (add intel_iommu=on to the kernel command line); not binding" >&2
+		rc=1
+		continue
+	fi
+	grp=$(basename "$(readlink "$dev/iommu_group")")
+	case "$grp" in '' | *[!0-9]*)
+		echo "$bdf: unexpected IOMMU group \"$grp\"; not binding" >&2
+		rc=1
+		continue
+		;;
+	esac
+
+	# Anything else in the group must be idle. Never touch those devices.
+	busy=""
+	for peer in "$dev"/iommu_group/devices/*; do
+		[ -e "$peer" ] || continue
+		p=${peer##*/}
+		[ "$p" = "$bdf" ] && continue
+		case "$(driver_of "$peer")" in '' | vfio-pci | pci-stub | pcieport) continue ;; esac
+		case "$(cat "$peer/class" 2>/dev/null)" in 0x0604*) continue ;; esac
+		busy="$busy $p($(driver_of "$peer"))"
+	done
+	if [ -n "$busy" ]; then
+		echo "$bdf: shares IOMMU group $grp with devices in use:$busy; not binding." >&2
+		echo "$bdf: move the card to another PCIe slot. Do not bind those devices to vfio-pci." >&2
+		rc=1
+		continue
+	fi
+
+	drv=$(driver_of "$dev")
+	if [ "$drv" != vfio-pci ]; then
+		if [ -n "$drv" ]; then
+			echo "$bdf: held by the \"$drv\" driver; leaving it alone" >&2
+			rc=1
+			continue
+		fi
+		if ! run modprobe vfio-pci; then
+			echo "$bdf: cannot load vfio-pci" >&2
+			rc=1
+			continue
+		fi
+		write vfio-pci "$dev/driver_override"
+		write "$bdf" "$SYS/bus/pci/drivers_probe"
+		if [ -z "$DRY" ] && [ "$(driver_of "$dev")" != vfio-pci ]; then
+			echo "$bdf: vfio-pci did not accept the card" >&2
+			rc=1
+			continue
+		fi
+	fi
+
+	node="$DEV/vfio/$grp"
+	if [ -z "$DRY" ]; then
+		for _ in 1 2 3 4 5 6 7 8 9 10; do	# udev creates the node shortly after the bind
+			[ -e "$node" ] && break
+			sleep 0.2
+		done
+		if [ ! -c "$node" ]; then
+			echo "$bdf: $node did not appear" >&2
+			rc=1
+			continue
+		fi
+	fi
+	run chown "$user" "$node"
+	run chmod 600 "$node"
+	echo "$bdf: bound to vfio-pci, $node belongs to $user"
+done
+
+if [ "$found" = 0 ]; then
+	echo "no HD60 Pro found" >&2
+	exit 1
+fi
+exit $rc
