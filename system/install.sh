@@ -47,11 +47,13 @@ cat > "$tmp/hd60pro-bind.service" <<UNIT
 [Unit]
 Description=Hand the Elgato HD60 Pro to vfio-pci for user $user
 After=systemd-modules-load.service
-Before=systemd-user-sessions.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Never let a stuck bind hold up boot. Logins do not wait for this unit:
+# the user service skips cleanly (ExecCondition) when the card is not bound.
+TimeoutStartSec=30
 ExecStart=/usr/local/libexec/hd60pro-bind $user
 
 [Install]

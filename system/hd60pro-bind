@@ -28,8 +28,9 @@ run() {
 	if [ -n "$DRY" ]; then echo "RUN: $*"; else "$@"; fi
 }
 
-write() {	# write VALUE FILE
-	if [ -n "$DRY" ]; then echo "RUN: echo $1 > $2"; else echo "$1" > "$2"; fi
+write() {	# write VALUE FILE; a sysfs write that hangs must not hang boot
+	if [ -n "$DRY" ]; then echo "RUN: echo $1 > $2"; return 0; fi
+	timeout 10 sh -c 'echo "$1" > "$2"' _ "$1" "$2"
 }
 
 driver_of() {
@@ -82,13 +83,17 @@ for dev in "$SYS"/bus/pci/devices/*; do
 			rc=1
 			continue
 		fi
-		if ! run modprobe vfio-pci; then
+		if ! run timeout 20 modprobe vfio-pci; then
 			echo "$bdf: cannot load vfio-pci" >&2
 			rc=1
 			continue
 		fi
-		write vfio-pci "$dev/driver_override"
-		write "$bdf" "$SYS/bus/pci/drivers_probe"
+		if ! write vfio-pci "$dev/driver_override" ||
+			! write "$bdf" "$SYS/bus/pci/drivers_probe"; then
+			echo "$bdf: binding to vfio-pci failed or timed out" >&2
+			rc=1
+			continue
+		fi
 		if [ -z "$DRY" ] && [ "$(driver_of "$dev")" != vfio-pci ]; then
 			echo "$bdf: vfio-pci did not accept the card" >&2
 			rc=1
