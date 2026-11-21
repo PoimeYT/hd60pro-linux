@@ -83,6 +83,20 @@ for dev in "$SYS"/bus/pci/devices/*; do
 			rc=1
 			continue
 		fi
+		# The HD60 Pro does not survive a PCI bus reset: vfio-pci resets the
+		# card when it binds, and with the default "pm bus" methods that hard
+		# locks the whole PCIe bus. Turn resets off for this card first and
+		# never bind if that is not possible.
+		if [ -z "$DRY" ] && [ ! -e "$dev/reset_method" ]; then
+			echo "$bdf: kernel has no reset_method control (needs 5.15+); not binding" >&2
+			rc=1
+			continue
+		fi
+		if ! write "" "$dev/reset_method"; then
+			echo "$bdf: could not disable PCI reset; not binding" >&2
+			rc=1
+			continue
+		fi
 		if ! run timeout 20 modprobe vfio-pci; then
 			echo "$bdf: cannot load vfio-pci" >&2
 			rc=1
