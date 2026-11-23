@@ -97,11 +97,27 @@ for dev in "$SYS"/bus/pci/devices/*; do
 			rc=1
 			continue
 		fi
-		if ! run timeout 20 modprobe vfio-pci; then
+		if ! run timeout 20 modprobe vfio-pci disable_idle_d3=1; then
 			echo "$bdf: cannot load vfio-pci" >&2
 			rc=1
 			continue
 		fi
+		# A cold card also does not come back from D3hot: vfio-pci parks idle
+		# devices in D3hot and waking it hard locks the machine. Keep it in
+		# D0. The module may already be loaded without the option, so set
+		# the (runtime-writable) parameter too, and never bind without it.
+		d3=$SYS/module/vfio_pci/parameters/disable_idle_d3
+		if [ -z "$DRY" ] && [ ! -w "$d3" ]; then
+			echo "$bdf: cannot find vfio-pci's disable_idle_d3 parameter; not binding" >&2
+			rc=1
+			continue
+		fi
+		if ! write Y "$d3" || { [ -z "$DRY" ] && [ "$(cat "$d3")" != Y ]; }; then
+			echo "$bdf: could not keep the card out of D3; not binding" >&2
+			rc=1
+			continue
+		fi
+		write on "$dev/power/control" || true
 		if ! write vfio-pci "$dev/driver_override" ||
 			! write "$bdf" "$SYS/bus/pci/drivers_probe"; then
 			echo "$bdf: binding to vfio-pci failed or timed out" >&2
